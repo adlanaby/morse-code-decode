@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+Morse Studio - text <-> Morse sound, in pure Python (standard library only).
+
+  python morse.py encode "SOS HELLO" -o sos.wav --wpm 15 --freq 600 [--play]
+  python morse.py decode sos.wav            # WAV file -> text
+  python morse.py listen --seconds 15       # microphone -> text (needs: pip install sounddevice)
+  python morse.py tomorse "hello world"     # text  -> dots and dashes
+  python morse.py frommorse ".... .. / -.-." # dots and dashes -> text
+"""
+import argparse
+import array
+import math
+import re
+import subprocess
+import sys
+import tempfile
+import wave
+
+MORSE = {
+    'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.', 'G': '--.',
+    'H': '....', 'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..', 'M': '--', 'N': '-.',
+    'O': '---', 'P': '.--.', 'Q': '--.-', 'R': '.-.', 'S': '...', 'T': '-', 'U': '..-',
+    'V': '...-', 'W': '.--', 'X': '-..-', 'Y': '-.--', 'Z': '--..',
+    '0': '-----', '1': '.----', '2': '..---', '3': '...--', '4': '....-', '5': '.....',
+    '6': '-....', '7': '--...', '8': '---..', '9': '----.',
+    '.': '.-.-.-', ',': '--..--', '?': '..--..', "'": '.----.', '!': '-.-.--', '/': '-..-.',
+    '(': '-.--.', ')': '-.--.-', '&': '.-...', ':': '---...', ';': '-.-.-.', '=': '-...-',
+    '+': '.-.-.', '-': '-....-', '_': '..--.-', '"': '.-..-.', '$': '...-..-', '@': '.--.-.',
+}
+REV = {v: k for k, v in MORSE.items()}
+
+
+# ---------------------------------------------------------------- text <-> morse
+def to_morse(text):
+    """'HELLO WORLD' -> '.... . .-.. .-.. --- / .-- --- .-. .-.. -..'"""
+    words = []
+    for w in text.upper().split():
+        letters = [MORSE[c] for c in w if c in MORSE]
+        if letters:
+            words.append(' '.join(letters))
+    return ' / '.join(words)
+
+
+def from_morse(code):
+    """Letters separated by spaces, words by '/' (or 3+ spaces)."""
+    words = re.split(r'\s*/\s*|\s{3,}', code.strip())
+    return ' '.join(''.join(REV.get(s, '?') for s in w.split()) for w in words)
+
+
+# ---------------------------------------------------------------- encoder (text -> sound)
+def synthesize(text, wpm=15, freq=600, rate=44100, volume=0.5):
+    """Return 16-bit samples for the Morse of `text` (PARIS timing: unit = 1.2 / wpm s)."""
+    code = to_morse(text)
+    if not code:
+        raise ValueError("Nothing to encode (no Morse-able characters).")
+    u = 1.2 / wpm
+    buf = array.array('h')
+    amp = 32767 * volume
+    step = 2 * math.pi * freq / rate
+
+    def silence(sec):
+        buf.extend([0] * int(rate * sec))
+
+    def tone(sec):
+        n = int(rate * sec)
+        ramp = max(1, min(int(rate * 0.005), n // 2))  # 5 ms fade avoids clicks
+        for i in range(n):
+            env = 1.0
+            if i < ramp:
+                env = 0.5 - 0.5 * math.cos(math.pi * i / ramp)
+            elif i >= n - ramp:
+                env = 0.5 - 0.5 * math.cos(math.pi * (n - 1 - i) / ramp)
+            buf.append(int(amp * env * math.sin(step * i)))
+
+    silence(0.3)
+    for ch in code:
+        if ch == '.':
+            tone(u); silence(u)
+        elif ch == '-':
+            tone(3 * u); silence(u)
+        else:                      # ' ' or '/'  -> together give 3u (letter) / 7u (word)
+            silence(2 * u)
+    silence(0.3)
+    return buf, rate
+
+
+def write_wav(path, samples, rate):
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        data = array.array('h', samples)
+        if sys.byteorder == 'big':
+            data.byteswap()
+        w.writeframes(data.tobytes())
+
+
+def play_file(path):
+    if sys.platform.startswith('win'):
+        import winsound
+        winsound.PlaySound(path, winsound.SND_FILENAME)
+    elif sys.platform == 'darwin':
+        subprocess.run(['afplay', path])
+    else:
+        for cmd in (['paplay'], ['aplay', '-q'], ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']):
+            try:
+                subprocess.run(cmd + [path], check=True)
+                return
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+        print("No audio player found; open the WAV file manually.")
+
+
+# ---------------------------------------------------------------- decoder (sound -> text)
+def read_wav(path):
+    with wave.open(path, 'rb') as w:
+        ch, sw, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+        raw = w.readframes(w.getnframes())
+    if sw == 2:
+        a = array.array('h')
+        a.frombytes(raw)
+        if sys.byteorder == 'big':
+            a.byteswap()
+        vals = [v / 32768.0 for v in a]
+    elif sw == 1:
+        vals = [(b - 128) / 128.0 for b in raw]
+    else:
+        raise ValueError("Only 8-bit and 16-bit WAV files are supported.")
+    if ch > 1:
+        vals = [sum(vals[i:i + ch]) / ch for i in range(0, len(vals) - ch + 1, ch)]
+    return vals, rate
+
+
+def goertzel(block, coeff):
+    s1 = s2 = 0.0
+    for x in block:
+        s0 = x + coeff * s1 - s2
+        s2, s1 = s1, s0
+    return s1 * s1 + s2 * s2 - coeff * s1 * s2
+
+
+def find_freq(x, rate, lo=300, hi=1500):
+    """Pick the strongest steady tone between lo and hi Hz."""
+    blk = int(rate * 0.02)
+    seg = x[:rate * 5]
+    blocks = [seg[i:i + blk] for i in range(0, len(seg) - blk + 1, blk)]
+    if not blocks:
+        raise ValueError("Audio is too short.")
+    energy = sorted(range(len(blocks)), key=lambda i: -sum(v * v for v in blocks[i]))
+    loud = [blocks[i] for i in energy[:max(5, len(blocks) // 4)]]
+
+    def score(f):
+        c = 2 * math.cos(2 * math.pi * f / rate)
+        return sum(goertzel(b, c) for b in loud)
+
+    best = max(range(lo, hi + 1, 25), key=score)
+    return max(range(best - 25, best + 26, 5), key=score)
+
+
+def envelope(x, rate, freq, ms=6):
+    blk = max(8, int(rate * ms / 1000))
+    c = 2 * math.cos(2 * math.pi * freq / rate)
+    env = [math.sqrt(max(goertzel(x[i:i + blk], c), 0.0)) / blk
+           for i in range(0, len(x) - blk + 1, blk)]
+    return env, blk / rate
+
+
+def to_runs(env, minlen=2):
+    s = sorted(env)
+    lo, hi = s[int(len(s) * 0.10)], s[min(len(s) - 1, int(len(s) * 0.98))]
+    if hi < 1e-4 or hi < lo * 2.5:
+        raise ValueError("No clear beeps found in the audio.")
+    thr = lo + (hi - lo) * 0.4
+    runs = []
+    for v in env:
+        st = v > thr
+        if runs and runs[-1][0] == st:
+            runs[-1][1] += 1
+        else:
+            runs.append([st, 1])
+    out = []                                   # remove tiny glitches
+    for st, n in runs:
+        if n < minlen:
+            if out:
+                out[-1][1] += n
+        elif out and out[-1][0] == st:
+            out[-1][1] += n
+        else:
+            out.append([st, n])
+    while out and not out[0][0]:               # trim leading / trailing silence
+        out.pop(0)
+    while out and not out[-1][0]:
+        out.pop()
+    return out
+
+
+def estimate_unit(on):
+    """Dot length from the 'on' durations (2-means: dots vs dashes)."""
+    c1, c2 = min(on), max(on)
+    if c2 < 2 * c1:
+        return sum(on) / len(on)               # a single kind of beep: assume dots
+    for _ in range(20):
+        a = [d for d in on if abs(d - c1) <= abs(d - c2)]
+        b = [d for d in on if abs(d - c1) > abs(d - c2)]
+        c1, c2 = sum(a) / len(a), sum(b) / len(b)
+    return (c1 + c2 / 3) / 2
+
+
+def decode_samples(x, rate, freq=None):
+    freq = freq or find_freq(x, rate)
+    env, dt = envelope(x, rate, freq)
+    runs = to_runs(env)
+    if not runs:
+        raise ValueError("No Morse signal detected.")
+    u = estimate_unit([n * dt for st, n in runs if st])
+    code = ''
+    for st, n in runs:
+        d = n * dt
+        if st:
+            code += '-' if d > 2 * u else '.'
+        elif d > 5 * u:
+            code += ' / '
+        elif d > 2 * u:
+            code += ' '
+    return from_morse(code), code, 1.2 / u, freq
+
+
+def record(seconds, rate=44100):
+    try:
+        import sounddevice as sd
+    except ImportError:
+        sys.exit("Microphone mode needs:  pip install sounddevice")
+    print(f"Listening for {seconds} s... start your Morse now.")
+    data = sd.rec(int(seconds * rate), samplerate=rate, channels=1, dtype='float32')
+    sd.wait()
+    return [float(v) for v in data[:, 0]], rate
+
+
+# ---------------------------------------------------------------- command line
+def show(result):
+    text, code, wpm, freq = result
+    print(f"Tone: {freq} Hz   Speed: ~{wpm:.0f} WPM")
+    print(f"Morse: {code}")
+    print(f"Text : {text}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Morse code encoder / decoder")
+    sub = p.add_subparsers(dest='cmd')
+
+    e = sub.add_parser('encode', help='text -> WAV sound')
+    e.add_argument('text')
+    e.add_argument('-o', '--out', default='morse.wav')
+    e.add_argument('--wpm', type=float, default=15)
+    e.add_argument('--freq', type=float, default=600)
+    e.add_argument('--play', action='store_true', help='play the sound after saving')
+
+    d = sub.add_parser('decode', help='WAV file -> text')
+    d.add_argument('file')
+    d.add_argument('--freq', type=float, help='tone in Hz (auto-detected if omitted)')
+
+    l = sub.add_parser('listen', help='microphone -> text')
+    l.add_argument('--seconds', type=float, default=15)
+    l.add_argument('--freq', type=float)
+
+    t = sub.add_parser('tomorse', help='text -> dots and dashes')
+    t.add_argument('text')
+    f = sub.add_parser('frommorse', help='dots and dashes -> text')
+    f.add_argument('code')
+
+    a = p.parse_args()
+    try:
+        if a.cmd == 'encode':
+            samples, rate = synthesize(a.text, a.wpm, a.freq)
+            write_wav(a.out, samples, rate)
+            print(f"Saved {a.out}  ({len(samples) / rate:.1f} s)   {to_morse(a.text)}")
+            if a.play:
+                play_file(a.out)
+        elif a.cmd == 'decode':
+            x, rate = read_wav(a.file)
+            show(decode_samples(x, rate, a.freq))
+        elif a.cmd == 'listen':
+            x, rate = record(a.seconds)
+            show(decode_samples(x, rate, a.freq))
+        elif a.cmd == 'tomorse':
+            print(to_morse(a.text))
+        elif a.cmd == 'frommorse':
+            print(from_morse(a.code))
+        else:
+            p.print_help()
+    except ValueError as err:
+        sys.exit(f"Error: {err}")
+
+
+if __name__ == '__main__':
+    main()
